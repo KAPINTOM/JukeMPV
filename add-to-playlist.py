@@ -1,33 +1,104 @@
 #!/usr/bin/env python3
 """
-Add a YouTube link to playlists.json using yt-dlp.
-The entry key is the video/playlist title, the value is the URL.
+Add a YouTube link to playlists.json using only the standard library.
+Works for both videos and playlists by parsing embedded JSON from the page.
 """
 
 import json
 import os
-import subprocess
-import sys
+import re
+import urllib.error
+import urllib.parse
+import urllib.request
+from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
 
-# Path to the JSON file (same directory as this script)
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 JSON_PATH = os.path.join(SCRIPT_DIR, "playlists.json")
 
-def get_youtube_title(url):
-    """Return the title (video or playlist) for the given YouTube URL using yt-dlp."""
-    # Command: get JSON info without downloading, flat mode for playlists
-    cmd = ["yt-dlp", "-j", "--skip-download", "--flat-playlist", url]
+def clean_url(url):
+    """Remove tracking parameters like 'si' from a YouTube URL."""
+    parsed = urlparse(url)
+    query_dict = parse_qs(parsed.query, keep_blank_values=True)
+    if 'si' in query_dict:
+        print("Removing 'si' tracking parameter from URL...")
+        del query_dict['si']
+    new_query = urlencode(query_dict, doseq=True) if query_dict else ""
+    cleaned_url = urlunparse(parsed._replace(query=new_query))
+    return cleaned_url
+
+def fetch_html(url):
+    """Fetch the HTML content of a YouTube page."""
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
-        data = json.loads(result.stdout)
-        # For playlists, the key 'playlist_title' exists; for videos, use 'title'
-        return data.get("playlist_title") or data.get("title")
-    except subprocess.CalledProcessError as e:
-        print(f"yt-dlp error (exit {e.returncode}): {e.stderr.strip()}")
-    except json.JSONDecodeError:
-        print(f"Failed to parse yt-dlp output for: {url}")
-    except FileNotFoundError:
-        print("yt-dlp command not found. Please install yt-dlp.")
+        with urllib.request.urlopen(url, timeout=15) as response:
+            return response.read().decode('utf-8')
+    except urllib.error.URLError as e:
+        print(f"Network error: {e}")
+        return None
+
+def extract_json_blob(html, var_name):
+    """Extract a JavaScript JSON blob like 'var ytInitialData = {...};'."""
+    # Use double braces {{ and }} to escape literal curly braces in the f‑string
+    pattern = re.compile(rf'var {var_name} = ({{.+?}});', re.DOTALL)
+    match = pattern.search(html)
+    if match:
+        try:
+            return json.loads(match.group(1))
+        except json.JSONDecodeError:
+            pass
+    return None
+
+def get_youtube_title(url):
+    """Extract title from a YouTube video or playlist URL."""
+    cleaned_url = clean_url(url)
+    html = fetch_html(cleaned_url)
+    if not html:
+        return None
+
+    # 1. Try ytInitialPlayerResponse (present on video pages)
+    player_response = extract_json_blob(html, "ytInitialPlayerResponse")
+    if player_response:
+        try:
+            title = player_response.get("videoDetails", {}).get("title")
+            if title:
+                return title
+        except (KeyError, AttributeError):
+            pass
+
+    # 2. Try ytInitialData (used by both videos and playlists)
+    initial_data = extract_json_blob(html, "ytInitialData")
+    if initial_data:
+        # For videos, the title may be inside videoDetails (sometimes present here too)
+        try:
+            title = initial_data.get("videoDetails", {}).get("title")
+            if title:
+                return title
+        except (KeyError, AttributeError):
+            pass
+
+        # For playlists: try the metadata path first (most reliable)
+        try:
+            title = initial_data["metadata"]["playlistMetadataRenderer"]["title"]
+            if title:
+                return title
+        except (KeyError, TypeError):
+            pass
+
+        # Another playlist path (deeper for some layouts)
+        try:
+            contents = initial_data["contents"]["twoColumnBrowseResultsRenderer"]["tabs"][0]["tabRenderer"]["content"]["sectionListRenderer"]["contents"][0]["itemSectionRenderer"]["contents"][0]["playlistHeaderRenderer"]["title"]["runs"][0]["text"]
+            return contents
+        except (KeyError, IndexError, TypeError):
+            pass
+
+        # For videos: sometimes the title is inside 'title' under 'microformat'
+        try:
+            title = initial_data["microformat"]["microformatDataRenderer"]["title"]
+            if title:
+                return title
+        except (KeyError, TypeError):
+            pass
+
+    print("Could not extract title from the page.")
     return None
 
 def load_json(file_path):
@@ -45,7 +116,7 @@ def save_json(file_path, data):
     """Save dictionary to JSON with indentation."""
     with open(file_path, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2, ensure_ascii=False)
-        f.write("\n")  # trailing newline
+        f.write("\n")
 
 def main():
     link = input("Enter YouTube video or playlist URL: ").strip()
@@ -58,7 +129,6 @@ def main():
         print("Could not retrieve title. Check the URL and your network.")
         return
 
-    # Update JSON
     data = load_json(JSON_PATH)
     data[title] = link
     save_json(JSON_PATH, data)
