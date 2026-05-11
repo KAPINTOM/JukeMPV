@@ -44,14 +44,14 @@ JukeMPV reads a `playlists.json` file, displays a numbered colour-coded menu in 
 ```bash
 git clone https://github.com/KAPINTOM/JukeMPV
 cd JukeMPV
-python mpv_launcher.py
+python jukempv.py.py
 ```
 
 ### Pre-compiled GNU/Linux binary
 
 ```bash
-chmod +x ./jukempv
-./jukempv
+chmod +x ./JukeMPV
+./JukeMPV
 ```
 
 ---
