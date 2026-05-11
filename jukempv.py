@@ -43,9 +43,9 @@ def clear():
 
 def header():
     print(clr(c.bold, c.blue,
-        "╔════════════════════╗\n"
-        "║   🎵  JukeMPV  🎵   ║\n"
-        "╚════════════════════╝"))
+        "════════════════════\n"
+        "   🎵  JukeMPV  🎵   \n"
+        "════════════════════"))
     print()
 
 def ok(msg: str):
@@ -105,8 +105,14 @@ def main():
     if len(sys.argv) > 1:
         config_path = Path(sys.argv[1])
     else:
-        # FIX 6: resolve relative to the script's own directory, not the shell's CWD
-        config_path = Path(__file__).parent / "playlists.json"
+        # FIX 6: resolve relative to the script/binary's own directory, not CWD.
+        # Under PyInstaller sys.frozen is set and sys.executable points to the
+        # actual binary; __file__ would resolve to the temp extraction dir instead.
+        if getattr(sys, "frozen", False):
+            base_path = Path(sys.executable).parent
+        else:
+            base_path = Path(__file__).parent
+        config_path = base_path / "playlists.json"
 
     playlists = load_playlists(config_path)
 
