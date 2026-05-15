@@ -47,11 +47,18 @@ cd JukeMPV
 python jukempv.py.py
 ```
 
-### Pre-compiled GNU/Linux binary
+### Compile your own binary
+
+You can compile a binary using pyinstaller
 
 ```bash
-chmod +x ./JukeMPV
-./JukeMPV
+pipx install pyinstaller
+pipx run pyinstaller
+pyinstaller --onefile jukempv.py
+pyinstaller --onefile add-to-playlist.py
+cd dist
+chmod +xrw jukempv add-to-playlist
+./jukempv
 ```
 
 ---
