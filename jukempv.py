@@ -139,8 +139,43 @@ def main():
     selected_name = names[choice - 1]
     url = playlists[selected_name]
 
+    # ── Speed selection ───────────────────────────────────────────────────────
+    PRESET_SPEEDS = [0.75, 0.80, 0.85, 0.90, 0.95, 1.00, 1.25, 1.50, 1.75, 2.00]
+
+    print()
+    print(clr(c.bold, c.white, "  Playback Speed"))
+    print(clr(c.dim,           "  ─────────────────────────────────────"))
+    for i, spd in enumerate(PRESET_SPEEDS, 1):
+        marker = clr(c.bold, c.green, " ◀ default") if spd == 1.00 else ""
+        print(f"  {clr(c.bold, c.cyan, f'[{i}]')}  {clr(c.white, f'{spd:.2f}x')}{marker}")
+    custom_idx = len(PRESET_SPEEDS) + 1
+    print(f"  {clr(c.bold, c.yellow, f'[{custom_idx}]')}  Custom speed\n")
+
+    speed_choice = prompt_int("  Select a speed: ", 1, custom_idx)
+
+    if speed_choice == custom_idx:
+        # Custom speed — keep asking until we get a valid positive float
+        while True:
+            try:
+                raw = input(clr(c.bold, c.yellow, "  Enter custom speed (e.g. 1.3): ")).strip()
+                custom_speed = float(raw)
+                if custom_speed > 0:
+                    playback_speed = custom_speed
+                    break
+                print(clr(c.red, "  Speed must be greater than 0."))
+            except ValueError:
+                print(clr(c.red, "  Please enter a valid number."))
+            except (EOFError, KeyboardInterrupt):
+                print(clr(c.dim, "\nGoodbye!\n"))
+                sys.exit(0)
+    else:
+        playback_speed = PRESET_SPEEDS[speed_choice - 1]
+
+    ok(f"Speed set to {playback_speed}x")
+
     # Build mpv command arguments (excluding the program name itself)
     mpv_args = [
+        f"--speed={playback_speed}",
         "--ytdl-format=bestaudio",
         # "--no-video",   # keep video if available (you can toggle this)
         "--shuffle",
