@@ -4,7 +4,7 @@ mpv-launcher — simple YouTube playlist quick-launcher for mpv
 Shows a menu, then replaces itself with mpv — no launcher stays in memory.
 """
 
-from __future__ import annotations  # FIX 1: enables dict[str, str] on Python 3.7/3.8
+from __future__ import annotations  # enables dict[str, str] on Python 3.7/3.8
 
 import json
 import os
@@ -23,19 +23,21 @@ class c:
     cyan   = "\033[36m"
     white  = "\033[97m"
 
-# FIX 2: enable ANSI on Windows so colours and clear() work in cmd/PowerShell
+# Enable ANSI on Windows so colours and clear() work in cmd/PowerShell
 if sys.platform == "win32":
     import ctypes
-    ctypes.windll.kernel32.SetConsoleMode(
-        ctypes.windll.kernel32.GetStdHandle(-11), 7
-    )
+    try:
+        ctypes.windll.kernel32.SetConsoleMode(
+            ctypes.windll.kernel32.GetStdHandle(-11), 7
+        )
+    except Exception:
+        pass  # non-fatal: colours just won't render
 
 def clr(*parts) -> str:
     return "".join(parts) + c.reset
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 def clear():
-    # FIX 3: use the correct clear command per platform
     if sys.platform == "win32":
         os.system("cls")
     else:
@@ -57,23 +59,69 @@ def info(msg: str):
 def err(msg: str):
     print(clr(c.red, c.bold, "[error] ") + clr(c.red, msg), file=sys.stderr)
 
+def _goodbye():
+    print(clr(c.dim, "\nGoodbye!\n"))
+    sys.exit(0)
+
 def prompt_int(prompt: str, lo: int, hi: int) -> int:
+    """Prompt for an integer in [lo, hi]. Loops on bad input."""
     while True:
         try:
             raw = input(clr(c.bold, c.yellow, prompt))
             val = int(raw.strip())
             if lo <= val <= hi:
                 return val
+            print(clr(c.red, f"  Please enter a number between {lo} and {hi}."))
         except ValueError:
-            pass
+            print(clr(c.red, f"  '{raw.strip()}' is not a valid number. Try again."))
         except (EOFError, KeyboardInterrupt):
-            # FIX 4: handle Ctrl+C / Ctrl+D cleanly instead of dumping a traceback
-            print(clr(c.dim, "\nGoodbye!\n"))
-            sys.exit(0)
-        print(clr(c.red, f"  Please enter a number between {lo} and {hi}."))
+            _goodbye()
+
+def prompt_int_or_default(prompt: str, lo: int, hi: int, default: int) -> int:
+    """Like prompt_int, but pressing Enter (empty input) returns `default`."""
+    while True:
+        try:
+            raw = input(clr(c.bold, c.yellow, prompt)).strip()
+            if raw == "":
+                return default
+            val = int(raw)
+            if lo <= val <= hi:
+                return val
+            print(clr(c.red,
+                f"  Please enter a number between {lo} and {hi}, "
+                f"or press Enter to use the default."))
+        except ValueError:
+            print(clr(c.red,
+                f"  '{raw}' is not a valid number. "
+                f"Enter a number between {lo} and {hi}, or press Enter for default."))
+        except (EOFError, KeyboardInterrupt):
+            _goodbye()
+
+def prompt_float_positive(prompt: str) -> float:
+    """Prompt for a positive float speed value, with detailed error messages."""
+    while True:
+        try:
+            raw = input(clr(c.bold, c.yellow, prompt)).strip()
+            if not raw:
+                print(clr(c.red, "  Please enter a value, e.g. 1.3  (or press Ctrl+C to quit)"))
+                continue
+            val = float(raw)
+            if val <= 0:
+                print(clr(c.red, "  Speed must be greater than 0."))
+            elif val > 100:
+                print(clr(c.red, "  Speed seems unreasonably high (max allowed: 100). Try again."))
+            else:
+                return val
+        except ValueError:
+            print(clr(c.red,
+                f"  '{raw}' is not a valid number. "
+                "Use a decimal like 1.3 or 0.8."))
+        except (EOFError, KeyboardInterrupt):
+            _goodbye()
 
 # ── Config loading ────────────────────────────────────────────────────────────
 def load_playlists(path: Path) -> dict[str, str]:
+    # File existence / read errors
     try:
         text = path.read_text(encoding="utf-8")
     except FileNotFoundError:
@@ -81,44 +129,64 @@ def load_playlists(path: Path) -> dict[str, str]:
             clr(c.red, f"Config file not found: {path}\n") +
             clr(c.dim, "Create it or pass a custom path as argument.")
         )
+    except PermissionError:
+        raise SystemExit(clr(c.red, f"Permission denied reading config: {path}"))
+    except OSError as e:
+        raise SystemExit(clr(c.red, f"Could not read config file: {e}"))
 
+    # Empty file
+    if not text.strip():
+        raise SystemExit(clr(c.red, f"Config file is empty: {path}"))
+
+    # JSON parse errors
     try:
         data = json.loads(text)
     except json.JSONDecodeError as e:
-        raise SystemExit(clr(c.red, f"JSON parse error: {e}"))
+        raise SystemExit(clr(c.red, f"JSON parse error in {path}:\n  {e}"))
 
-    if not isinstance(data, dict) or not all(
-        isinstance(k, str) and isinstance(v, str) for k, v in data.items()
-    ):
-        raise SystemExit(clr(c.red, "Invalid format. Expected a flat object of {name: url}."))
+    # Shape validation
+    if not isinstance(data, dict):
+        raise SystemExit(clr(c.red,
+            f"Invalid format: expected a JSON object, got {type(data).__name__}."))
 
-    # FIX 5: reject entries with blank names or blank URLs
+    bad_types = [k for k, v in data.items()
+                 if not isinstance(k, str) or not isinstance(v, str)]
+    if bad_types:
+        raise SystemExit(clr(c.red,
+            "Invalid format: all keys and values must be strings.\n"
+            f"  Offending keys: {', '.join(repr(k) for k in bad_types)}"))
+
+    # Blank name or URL
     invalid = [k for k, v in data.items() if not k.strip() or not v.strip()]
     if invalid:
-        bad = ", ".join(repr(k) for k in invalid)
-        raise SystemExit(clr(c.red, f"Playlist entries with empty name or URL: {bad}"))
+        raise SystemExit(clr(c.red,
+            f"Playlist entries with empty name or URL: "
+            f"{', '.join(repr(k) for k in invalid)}"))
 
     return data
 
 # ── Main (one-shot, then exec into mpv) ───────────────────────────────────────
 def main():
+    # ── Config path resolution ────────────────────────────────────────────────
     if len(sys.argv) > 1:
         config_path = Path(sys.argv[1])
     else:
-        # FIX 6: resolve relative to the script/binary's own directory, not CWD.
+        # Resolve relative to the script/binary's own directory, not CWD.
         # Under PyInstaller sys.frozen is set and sys.executable points to the
-        # actual binary; __file__ would resolve to the temp extraction dir instead.
+        # actual binary; __file__ would resolve to the temp extraction dir.
         if getattr(sys, "frozen", False):
             base_path = Path(sys.executable).parent
         else:
             base_path = Path(__file__).parent
         config_path = base_path / "playlists.json"
 
+    # ── Load playlists ────────────────────────────────────────────────────────
     playlists = load_playlists(config_path)
 
     if not playlists:
-        raise SystemExit(clr(c.red, "No playlists found."))
+        raise SystemExit(clr(c.red, "No playlists found in config."))
 
+    # ── Playlist menu ─────────────────────────────────────────────────────────
     clear()
     header()
 
@@ -133,67 +201,59 @@ def main():
 
     choice = prompt_int("  Select a playlist: ", 0, len(names))
     if choice == 0:
-        print(clr(c.dim, "\nGoodbye!\n"))
-        sys.exit(0)
+        _goodbye()
 
     selected_name = names[choice - 1]
     url = playlists[selected_name]
 
     # ── Speed selection ───────────────────────────────────────────────────────
     PRESET_SPEEDS = [0.75, 0.80, 0.85, 0.90, 0.95, 1.00, 1.25, 1.50, 1.75, 2.00]
+    DEFAULT_SPEED_IDX = PRESET_SPEEDS.index(1.00) + 1  # 1-based index → 6
+    custom_idx = len(PRESET_SPEEDS) + 1
 
     print()
     print(clr(c.bold, c.white, "  Playback Speed"))
     print(clr(c.dim,           "  ─────────────────────────────────────"))
     for i, spd in enumerate(PRESET_SPEEDS, 1):
-        marker = clr(c.bold, c.green, " ◀ default") if spd == 1.00 else ""
+        marker = clr(c.bold, c.green, " ◀ default (Enter)") if spd == 1.00 else ""
         print(f"  {clr(c.bold, c.cyan, f'[{i}]')}  {clr(c.white, f'{spd:.2f}x')}{marker}")
-    custom_idx = len(PRESET_SPEEDS) + 1
     print(f"  {clr(c.bold, c.yellow, f'[{custom_idx}]')}  Custom speed\n")
 
-    speed_choice = prompt_int("  Select a speed: ", 1, custom_idx)
+    speed_choice = prompt_int_or_default(
+        "  Select a speed (Enter = 1.00x): ",
+        lo=1, hi=custom_idx, default=DEFAULT_SPEED_IDX,
+    )
 
     if speed_choice == custom_idx:
-        # Custom speed — keep asking until we get a valid positive float
-        while True:
-            try:
-                raw = input(clr(c.bold, c.yellow, "  Enter custom speed (e.g. 1.3): ")).strip()
-                custom_speed = float(raw)
-                if custom_speed > 0:
-                    playback_speed = custom_speed
-                    break
-                print(clr(c.red, "  Speed must be greater than 0."))
-            except ValueError:
-                print(clr(c.red, "  Please enter a valid number."))
-            except (EOFError, KeyboardInterrupt):
-                print(clr(c.dim, "\nGoodbye!\n"))
-                sys.exit(0)
+        playback_speed = prompt_float_positive("  Enter custom speed (e.g. 1.3): ")
     else:
         playback_speed = PRESET_SPEEDS[speed_choice - 1]
 
     ok(f"Speed set to {playback_speed}x")
 
-    # Build mpv command arguments (excluding the program name itself)
+    # ── Build mpv args and launch ─────────────────────────────────────────────
     mpv_args = [
         f"--speed={playback_speed}",
         "--ytdl-format=bestaudio",
-        # "--no-video",   # keep video if available (you can toggle this)
+        # "--no-video",   # uncomment to force audio-only mode
         "--shuffle",
         url,
     ]
 
-    # Print a brief launch message before we hand over
     print(clr(c.green, c.bold, f"\nLaunching {selected_name}..."))
     print(clr(c.dim, "(The launcher will be replaced by mpv — press 'q' to quit mpv)\n"))
 
-    # Replace the current process with mpv
+    # Replace the current process with mpv (no launcher left in memory)
     try:
         os.execvp("mpv", ["mpv"] + mpv_args)
     except FileNotFoundError:
-        err("mpv not found. Install it with your package manager.")
+        err("mpv not found. Install it with your package manager "
+            "(e.g. 'sudo apt install mpv' or 'brew install mpv').")
+        sys.exit(1)
+    except PermissionError:
+        err("Permission denied when trying to run mpv. Check file permissions.")
         sys.exit(1)
     except OSError as e:
-        # FIX 7: catch broader OS errors (permissions, bad executable, etc.)
         err(f"Failed to launch mpv: {e}")
         sys.exit(1)
 
