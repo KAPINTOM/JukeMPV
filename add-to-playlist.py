@@ -3,6 +3,8 @@
 add-to-playlist.py
 ==================
 Add a YouTube video or playlist URL to a local ``playlists.json`` catalogue.
+Supports regular YouTube links, ``youtu.be`` short-links, and
+``music.youtube.com`` links (automatically rewritten to ``www.youtube.com``).
 
 Usage
 -----
@@ -40,7 +42,7 @@ SCRIPT_DIR: str = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_JSON_PATH: str = os.path.join(SCRIPT_DIR, "playlists.json")
 
 YOUTUBE_HOSTS: frozenset[str] = frozenset(
-    {"www.youtube.com", "youtube.com", "youtu.be", "m.youtube.com"}
+    {"www.youtube.com", "youtube.com", "youtu.be", "m.youtube.com", "music.youtube.com"}
 )
 
 # Tracking / noise query parameters that should be stripped from stored URLs.
@@ -94,7 +96,8 @@ def normalize_url(url: str) -> str:
     Steps applied:
       1. Strip tracking / noise query parameters (``si``, ``pp``, …).
       2. Convert ``youtu.be/<id>`` short-links to the canonical watch URL.
-      3. Remove any URL fragment (``#t=30``).
+      3. Rewrite ``music.youtube.com`` links to ``www.youtube.com``.
+      4. Remove any URL fragment (``#t=30``).
     """
     parsed: ParseResult = urlparse(url)
     host = parsed.netloc.lower()
@@ -116,6 +119,16 @@ def normalize_url(url: str) -> str:
         )
         log.debug("Expanded short-link → %s", parsed.geturl())
         return parsed.geturl()
+
+    # Rewrite music.youtube.com → www.youtube.com so the stored URL is always
+    # the standard YouTube domain, regardless of which surface the user copied
+    # the link from.
+    if host == "music.youtube.com":
+        log.debug("Rewriting music.youtube.com → www.youtube.com")
+        parsed = parsed._replace(
+            scheme="https",
+            netloc="www.youtube.com",
+        )
 
     # Strip noise parameters and fragment from regular URLs.
     query_dict = {
