@@ -1,9 +1,9 @@
 # JukeMPV
 
-![JukeMPV Screenshot](https://github.com/KAPINTOM/JukeMPV/blob/main/images/jukempv%20screenshot.png)
-
 A minimal, dependency-free YouTube playlist toolkit for the terminal.
 Two scripts work together: one builds your personal playlist catalogue, the other launches it in mpv.
+
+![JukeMPV Screenshot](https://github.com/KAPINTOM/JukeMPV/blob/main/images/jukempv%20screenshot.png)
 
 ```
 add-to-playlist.py   →   playlists.json   →   jukempv.py   →   mpv
