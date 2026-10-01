@@ -2,31 +2,59 @@
 """
 jukempv — YouTube playlist quick-launcher for mpv.
 
-Presents an interactive terminal menu, then replaces itself with mpv
-(via os.execvp on POSIX) so no launcher process remains in memory.
-On Windows, subprocess.run is used as a fallback since execvp is
-not a true process-replacement there.
+Shows an interactive terminal menu (playlist, then playback speed) and hands
+control over to mpv.  On POSIX the launcher process is *replaced* by mpv via
+os.execv, so nothing lingers in memory.  Windows has no true process
+replacement, so mpv runs as a child process there and its exit code is
+propagated.
 
 Usage:
-    python jukempv.py [path/to/playlists.json]
+    python jukempv.py [options] [path/to/playlists.json]
+
+Options:
+    --no-video     Never open a video window (audio only).
+    --no-shuffle   Play playlists in their original order.
 
 Config format (playlists.json):
     {
-        "Lo-Fi Chill":    "https://www.youtube.com/playlist?list=...",
-        "Deep Focus":     "https://www.youtube.com/playlist?list=..."
+        "Lo-Fi Chill": "https://www.youtube.com/playlist?list=...",
+        "Deep Focus":  "https://www.youtube.com/playlist?list=..."
     }
+
+Entries can be added automatically with add-to-playlist.py.
 """
 
 from __future__ import annotations
 
+import argparse
 import json
+import math
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
+from typing import NoReturn
+from urllib.parse import urlparse
+
+# ── Constants ─────────────────────────────────────────────────────────────────
+
+CONFIG_FILENAME = "playlists.json"
+
+MIN_SPEED = 0.01    # mpv's documented lower bound for --speed
+MAX_SPEED = 100.0   # mpv's documented upper bound for --speed
+
+_PRESET_SPEEDS: tuple[float, ...] = (
+    0.75, 0.80, 0.85, 0.90, 0.95,
+    1.00,
+    1.25, 1.50, 1.75, 2.00,
+)
+_DEFAULT_SPEED: float = 1.00
+
+_RULE_WIDTH = 37
 
 
-# ── ANSI escape codes ─────────────────────────────────────────────────────────
+# ── Output encoding & ANSI colour support ─────────────────────────────────────
 
 class Ansi:
     """Terminal colour/style escape sequences."""
@@ -41,35 +69,91 @@ class Ansi:
     WHITE  = "\033[97m"
 
 
-def _enable_ansi_on_windows() -> None:
-    """Enable ANSI VT processing in Windows cmd / PowerShell (non-fatal)."""
-    if sys.platform != "win32":
-        return
+class _Color:
+    """Whether colour is enabled for stdout / stderr (decided once at start-up)."""
+    out = False
+    err = False
+
+
+def _enable_windows_vt(std_handle_id: int) -> bool:
+    """
+    Turn on ANSI/VT processing for one Windows console handle.
+
+    The *current* console mode is read and the VT flag OR-ed in, so existing
+    flags are preserved.  Returns False if the handle is not a console.
+    """
     try:
         import ctypes
-        kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
-        kernel32.SetConsoleMode(kernel32.GetStdHandle(-11), 7)
+        from ctypes import wintypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.GetStdHandle.argtypes = [wintypes.DWORD]
+        kernel32.GetStdHandle.restype = wintypes.HANDLE
+        kernel32.GetConsoleMode.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+        kernel32.GetConsoleMode.restype = wintypes.BOOL
+        kernel32.SetConsoleMode.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+        kernel32.SetConsoleMode.restype = wintypes.BOOL
+
+        handle = kernel32.GetStdHandle(std_handle_id & 0xFFFFFFFF)
+        mode = wintypes.DWORD()
+        if not kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
+            return False
+        enable_virtual_terminal_processing = 0x0004
+        return bool(kernel32.SetConsoleMode(handle, mode.value | enable_virtual_terminal_processing))
     except Exception:
-        pass
+        return False
 
 
-_enable_ansi_on_windows()
+def _supports_color(stream, std_handle_id: int) -> bool:
+    """Colour only on real terminals, and honour the NO_COLOR convention."""
+    if os.environ.get("NO_COLOR"):
+        return False
+    if stream is None or not stream.isatty():
+        return False
+    if sys.platform == "win32":
+        return _enable_windows_vt(std_handle_id)
+    return os.environ.get("TERM", "") != "dumb"
 
 
-def styled(*codes: str, text: str) -> str:
-    """Wrap *text* with ANSI *codes* and append a reset."""
+def _init_terminal() -> None:
+    """
+    Make console output robust:
+
+    * never crash on characters the console encoding can't represent
+      (e.g. emoji when output is piped through a legacy Windows code page);
+    * enable colour only when it will actually render.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is not None:
+            try:
+                reconfigure(errors="replace")
+            except (OSError, ValueError):
+                pass
+
+    _Color.out = _supports_color(sys.stdout, -11)   # STD_OUTPUT_HANDLE
+    _Color.err = _supports_color(sys.stderr, -12)   # STD_ERROR_HANDLE
+
+
+def styled(*codes: str, text: str, err: bool = False) -> str:
+    """Wrap *text* with ANSI *codes* (when colour is enabled) and reset."""
+    enabled = _Color.err if err else _Color.out
+    if not enabled:
+        return text
     return "".join(codes) + text + Ansi.RESET
 
 
 # ── Terminal helpers ──────────────────────────────────────────────────────────
 
 def clear_screen() -> None:
-    """Clear the terminal in a cross-platform way."""
-    if sys.platform == "win32":
-        os.system("cls")
-    else:
+    """Clear the terminal (only when attached to one)."""
+    if not sys.stdout.isatty():
+        return
+    if _Color.out:
         sys.stdout.write("\033[2J\033[H")
         sys.stdout.flush()
+    elif sys.platform == "win32":
+        os.system("cls")
 
 
 def print_header() -> None:
@@ -79,254 +163,274 @@ def print_header() -> None:
 
 
 def print_ok(message: str) -> None:
-    prefix = styled(Ansi.GREEN, Ansi.BOLD, text="[✓] ")
-    print(prefix + message)
+    print(styled(Ansi.GREEN, Ansi.BOLD, text="[✓] ") + message)
 
 
-def print_info(message: str) -> None:
-    prefix = styled(Ansi.CYAN, Ansi.BOLD, text="[i] ")
-    print(prefix + message)
+def print_warning(message: str) -> None:
+    prefix = styled(Ansi.YELLOW, Ansi.BOLD, text="[!] ", err=True)
+    print(prefix + message, file=sys.stderr)
 
 
 def print_error(message: str) -> None:
-    prefix = styled(Ansi.RED, Ansi.BOLD, text="[error] ")
-    body   = styled(Ansi.RED, text=message)
+    prefix = styled(Ansi.RED, Ansi.BOLD, text="[error] ", err=True)
+    body   = styled(Ansi.RED, text=message, err=True)
     print(prefix + body, file=sys.stderr)
+
+
+def print_hint(message: str) -> None:
+    """Inline validation feedback shown beneath a prompt."""
+    print(styled(Ansi.RED, text=f"  {message}"))
 
 
 def print_section(title: str) -> None:
     heading   = styled(Ansi.BOLD, Ansi.WHITE, text=f"  {title}")
-    separator = styled(Ansi.DIM,              text="  " + "─" * 37)
+    separator = styled(Ansi.DIM, text="  " + "─" * _RULE_WIDTH)
     print(heading)
     print(separator)
 
 
-def goodbye() -> None:
+def die(message: str) -> NoReturn:
+    """Report a fatal error and exit with status 1."""
+    print_error(message)
+    sys.exit(1)
+
+
+def goodbye() -> NoReturn:
     print(styled(Ansi.DIM, text="\nGoodbye!\n"))
     sys.exit(0)
 
 
 # ── Input helpers ─────────────────────────────────────────────────────────────
 
-def prompt_int(prompt: str, lo: int, hi: int) -> int:
+def _read_line(prompt: str) -> str:
+    """input() wrapper: styled prompt, stripped result, clean exit on EOF/Ctrl-C."""
+    try:
+        return input(styled(Ansi.BOLD, Ansi.YELLOW, text=prompt)).strip()
+    except (EOFError, KeyboardInterrupt):
+        goodbye()
+
+
+def prompt_int(prompt: str, lo: int, hi: int, default: int | None = None) -> int:
     """
     Prompt for an integer in the closed interval [lo, hi].
-    Loops indefinitely on invalid input; exits cleanly on EOF/Ctrl-C.
+
+    If *default* is given, pressing Enter alone returns it.  Loops until the
+    input is valid; exits cleanly on EOF / Ctrl-C.
     """
-    formatted_prompt = styled(Ansi.BOLD, Ansi.YELLOW, text=prompt)
+    enter_hint = ", or press Enter for the default" if default is not None else ""
     while True:
+        raw = _read_line(prompt)
+        if not raw and default is not None:
+            return default
         try:
-            raw = input(formatted_prompt).strip()
             value = int(raw)
-            if lo <= value <= hi:
-                return value
-            print(styled(Ansi.RED, text=f"  Enter a number between {lo} and {hi}."))
         except ValueError:
-            print(styled(Ansi.RED, text=f"  '{raw}' is not a valid number. Try again."))
-        except (EOFError, KeyboardInterrupt):
-            goodbye()
+            shown = f"'{raw}'" if raw else "Empty input"
+            print_hint(f"{shown} is not a valid number. Enter {lo}–{hi}{enter_hint}.")
+            continue
+        if lo <= value <= hi:
+            return value
+        print_hint(f"Enter a number between {lo} and {hi}{enter_hint}.")
 
 
-def prompt_int_or_default(prompt: str, lo: int, hi: int, default: int) -> int:
+def prompt_speed(prompt: str) -> float:
     """
-    Like prompt_int, but pressing Enter alone returns *default*.
+    Prompt for a custom playback speed within mpv's supported range.
+
+    Accepts '.' or ',' as the decimal separator and rejects NaN / infinity
+    (which float() happily parses and every range comparison lets through).
     """
-    formatted_prompt = styled(Ansi.BOLD, Ansi.YELLOW, text=prompt)
     while True:
+        raw = _read_line(prompt)
+        if not raw:
+            print_hint("Please enter a value, e.g. 1.3  (Ctrl+C to quit).")
+            continue
         try:
-            raw = input(formatted_prompt).strip()
-            if raw == "":
-                return default
-            value = int(raw)
-            if lo <= value <= hi:
-                return value
-            print(styled(Ansi.RED,
-                text=f"  Enter a number between {lo} and {hi}, "
-                     f"or press Enter for the default."))
+            value = float(raw.replace(",", "."))
         except ValueError:
-            print(styled(Ansi.RED,
-                text=f"  '{raw}' is not a valid number. "
-                     f"Enter {lo}–{hi}, or press Enter for the default."))
-        except (EOFError, KeyboardInterrupt):
-            goodbye()
-
-
-def prompt_positive_float(prompt: str, max_value: float = 100.0) -> float:
-    """
-    Prompt for a positive float (e.g. a playback speed).
-    Rejects non-positive values and values exceeding *max_value*.
-    """
-    formatted_prompt = styled(Ansi.BOLD, Ansi.YELLOW, text=prompt)
-    while True:
-        try:
-            raw = input(formatted_prompt).strip()
-            if not raw:
-                print(styled(Ansi.RED,
-                    text="  Please enter a value, e.g. 1.3  (Ctrl+C to quit)."))
-                continue
-            value = float(raw)
-            if value <= 0:
-                print(styled(Ansi.RED, text="  Speed must be greater than 0."))
-            elif value > max_value:
-                print(styled(Ansi.RED,
-                    text=f"  Speed is unreasonably high (max: {max_value}). Try again."))
-            else:
-                return value
-        except ValueError:
-            print(styled(Ansi.RED,
-                text=f"  '{raw}' is not a valid number. Use a decimal like 1.3 or 0.8."))
-        except (EOFError, KeyboardInterrupt):
-            goodbye()
+            print_hint(f"'{raw}' is not a valid number. Use a decimal like 1.3 or 0.8.")
+            continue
+        if not math.isfinite(value) or not (MIN_SPEED <= value <= MAX_SPEED):
+            print_hint(f"Speed must be between {MIN_SPEED:g} and {MAX_SPEED:g}.")
+            continue
+        return value
 
 
 # ── Config loading ────────────────────────────────────────────────────────────
 
-def _resolve_config_path(argv: list[str]) -> Path:
-    """
-    Return the config file path from CLI args, or default to
-    playlists.json next to the script/binary.
+class ConfigError(Exception):
+    """Raised when the playlist config is missing, unreadable, or invalid."""
 
-    Under PyInstaller, sys.executable points to the bundled binary,
-    so we use that instead of __file__ (which resolves to a temp dir).
+
+def resolve_config_path(cli_path: str | None) -> Path:
     """
-    if len(argv) > 1:
-        return Path(argv[1])
+    Return the config path: the CLI argument if given, otherwise
+    playlists.json next to the script (or next to the executable when frozen
+    with PyInstaller, where __file__ points into a temporary directory).
+    """
+    if cli_path:
+        return Path(cli_path).expanduser()
 
     if getattr(sys, "frozen", False):
-        base = Path(sys.executable).parent
+        base = Path(sys.executable).resolve().parent
     else:
-        base = Path(__file__).parent
+        base = Path(__file__).resolve().parent
+    return base / CONFIG_FILENAME
 
-    return base / "playlists.json"
 
-
-def _validate_url(url: str) -> bool:
-    """Return True if *url* looks like an http(s) URL (basic sanity check)."""
-    return url.startswith(("http://", "https://"))
+def _is_valid_url(url: str) -> bool:
+    """True if *url* is an absolute http(s) URL with a host."""
+    try:
+        parsed = urlparse(url.strip())
+    except ValueError:
+        return False
+    return parsed.scheme in ("http", "https") and bool(parsed.netloc)
 
 
 def load_playlists(path: Path) -> dict[str, str]:
     """
-    Load and validate the JSON playlist config from *path*.
+    Load and validate the JSON playlist config.
 
     Expected format: a flat JSON object mapping playlist names to URLs.
-    Raises SystemExit with a descriptive message on any error.
+    Raises ConfigError with a descriptive message on any problem.
     """
-    # ── Read file ─────────────────────────────────────────────────────────────
     try:
-        text = path.read_text(encoding="utf-8")
+        # utf-8-sig transparently strips the BOM that Windows Notepad adds.
+        text = path.read_text(encoding="utf-8-sig")
     except FileNotFoundError:
-        raise SystemExit(
-            styled(Ansi.RED, text=f"Config file not found: {path}\n") +
-            styled(Ansi.DIM, text="Create it or pass a custom path as an argument.")
-        )
+        raise ConfigError(
+            f"Config file not found: {path}\n"
+            f"Create it, add entries with add-to-playlist.py, "
+            f"or pass a custom path as an argument."
+        ) from None
     except PermissionError:
-        raise SystemExit(styled(Ansi.RED, text=f"Permission denied reading config: {path}"))
+        raise ConfigError(f"Permission denied reading config: {path}") from None
+    except UnicodeDecodeError:
+        raise ConfigError(f"Config file is not valid UTF-8: {path}") from None
     except OSError as exc:
-        raise SystemExit(styled(Ansi.RED, text=f"Could not read config file: {exc}"))
+        raise ConfigError(f"Could not read config file: {exc}") from None
 
     if not text.strip():
-        raise SystemExit(styled(Ansi.RED, text=f"Config file is empty: {path}"))
+        raise ConfigError(f"Config file is empty: {path}")
 
-    # ── Parse JSON ────────────────────────────────────────────────────────────
     try:
         data = json.loads(text)
     except json.JSONDecodeError as exc:
-        raise SystemExit(styled(Ansi.RED, text=f"JSON parse error in {path}:\n  {exc}"))
+        raise ConfigError(f"JSON parse error in {path}:\n  {exc}") from None
 
-    # ── Shape validation ──────────────────────────────────────────────────────
     if not isinstance(data, dict):
-        raise SystemExit(styled(Ansi.RED,
-            text=f"Invalid format: expected a JSON object, got {type(data).__name__}."))
+        raise ConfigError(
+            f"Invalid format: expected a JSON object, got {type(data).__name__}."
+        )
+    if not data:
+        raise ConfigError(f"No playlists found in {path}.")
 
-    wrong_types = [
-        k for k, v in data.items()
-        if not isinstance(k, str) or not isinstance(v, str)
-    ]
-    if wrong_types:
-        keys = ", ".join(repr(k) for k in wrong_types)
-        raise SystemExit(styled(Ansi.RED,
-            text=f"Invalid format: all keys and values must be strings.\n"
-                 f"  Offending keys: {keys}"))
+    problems: list[str] = []
+    for name, url in data.items():
+        if not name.strip():
+            problems.append(f"{name!r}: playlist name is blank")
+        elif not isinstance(url, str) or not url.strip():
+            problems.append(f"{name!r}: URL must be a non-empty string")
+        elif not _is_valid_url(url):
+            problems.append(f"{name!r}: not a valid http(s) URL")
+    if problems:
+        raise ConfigError("Invalid playlist entries:\n  " + "\n  ".join(problems))
 
-    blank_entries = [k for k, v in data.items() if not k.strip() or not v.strip()]
-    if blank_entries:
-        keys = ", ".join(repr(k) for k in blank_entries)
-        raise SystemExit(styled(Ansi.RED,
-            text=f"Playlist entries with blank name or URL: {keys}"))
-
-    invalid_urls = [k for k, v in data.items() if not _validate_url(v)]
-    if invalid_urls:
-        keys = ", ".join(repr(k) for k in invalid_urls)
-        raise SystemExit(styled(Ansi.RED,
-            text=f"Playlist entries with invalid URLs (must start with http/https): {keys}"))
-
-    return data
+    return {name: url.strip() for name, url in data.items()}
 
 
 # ── mpv launcher ──────────────────────────────────────────────────────────────
 
-def launch_mpv(url: str, speed: float, label: str) -> None:
-    """
-    Build the mpv argument list and hand off execution to mpv.
+def _find_ytdl(mpv_path: str) -> bool:
+    """Look for yt-dlp / youtube-dl on PATH or beside the mpv binary."""
+    search_dirs = (None, os.path.dirname(mpv_path))
+    return any(
+        shutil.which(name, path=directory)
+        for name in ("yt-dlp", "youtube-dl")
+        for directory in search_dirs
+    )
 
-    On POSIX, os.execvp replaces the current process entirely so that no
-    launcher process lingers in memory.  On Windows, execvp is emulated by
-    the C runtime and does *not* free the Python process, so we fall back to
-    subprocess.run and exit cleanly afterwards.
-    """
-    mpv_args: list[str] = [
-        f"--speed={speed}",
+
+def build_mpv_args(url: str, speed: float, *, shuffle: bool, no_video: bool) -> list[str]:
+    """Return the mpv argument list (without the executable name)."""
+    args = [
+        f"--speed={speed:g}",
         "--ytdl-format=bestaudio",
-        # "--no-video",   # uncomment to force audio-only
-        "--shuffle",
-        url,
     ]
+    if shuffle:
+        args.append("--shuffle")
+    if no_video:
+        args.append("--no-video")
+    args.append(url)
+    return args
 
-    print(styled(Ansi.GREEN, Ansi.BOLD, text=f"\nLaunching '{label}'…"))
-    print(styled(Ansi.DIM,
-        text="(The launcher will be replaced by mpv — press 'q' to quit mpv)\n"))
 
-    try:
-        if sys.platform == "win32":
-            result = subprocess.run(["mpv"] + mpv_args, check=False)
-            sys.exit(result.returncode)
-        else:
-            os.execvp("mpv", ["mpv"] + mpv_args)
-    except FileNotFoundError:
-        print_error(
-            "mpv not found. Install it with your package manager:\n"
-            "  • Linux:  sudo apt install mpv\n"
-            "  • macOS:  brew install mpv\n"
+def launch_mpv(
+    url: str,
+    speed: float,
+    label: str,
+    *,
+    shuffle: bool = True,
+    no_video: bool = False,
+) -> NoReturn:
+    """
+    Hand execution over to mpv.
+
+    POSIX: os.execv replaces this process, so no launcher lingers in memory.
+    Windows: execv is emulated by the C runtime (it spawns a new process and
+    exits, leaving the console detached from the child), so mpv is run with
+    subprocess instead and its exit code is propagated.
+    """
+    mpv_path = shutil.which("mpv")
+    if mpv_path is None:
+        die(
+            "mpv not found on PATH. Install it with your package manager:\n"
+            "  • Linux:   sudo apt install mpv\n"
+            "  • macOS:   brew install mpv\n"
             "  • Windows: https://mpv.io/installation/"
         )
-        sys.exit(1)
+
+    if not _find_ytdl(mpv_path):
+        print_warning(
+            "yt-dlp was not found on PATH or next to mpv; "
+            "YouTube playback may fail. See https://github.com/yt-dlp/yt-dlp"
+        )
+
+    command = ["mpv", *build_mpv_args(url, speed, shuffle=shuffle, no_video=no_video)]
+    on_windows = sys.platform == "win32"
+
+    print(styled(Ansi.GREEN, Ansi.BOLD, text=f"\nLaunching '{label}'…"))
+    handoff = "mpv will run in this window" if on_windows else "The launcher will be replaced by mpv"
+    print(styled(Ansi.DIM, text=f"({handoff} — press 'q' to quit mpv)\n"))
+
+    # Anything still buffered would be lost when the process image is replaced.
+    sys.stdout.flush()
+    sys.stderr.flush()
+
+    try:
+        if on_windows:
+            try:
+                returncode = subprocess.run([mpv_path, *command[1:]], check=False).returncode
+            except KeyboardInterrupt:
+                returncode = 130
+            sys.exit(returncode)
+        os.execv(mpv_path, command)
     except PermissionError:
-        print_error("Permission denied when trying to run mpv. Check file permissions.")
-        sys.exit(1)
+        die("Permission denied when trying to run mpv. Check file permissions.")
     except OSError as exc:
-        print_error(f"Failed to launch mpv: {exc}")
-        sys.exit(1)
+        die(f"Failed to launch mpv: {exc}")
 
 
 # ── Interactive menus ─────────────────────────────────────────────────────────
 
-_PRESET_SPEEDS: tuple[float, ...] = (
-    0.75, 0.80, 0.85, 0.90, 0.95,
-    1.00,
-    1.25, 1.50, 1.75, 2.00,
-)
-_DEFAULT_SPEED: float = 1.00
-
-
 def select_playlist(playlists: dict[str, str]) -> tuple[str, str]:
     """Display the playlist menu and return (name, url) for the selection."""
-    names = list(playlists.keys())
+    names = list(playlists)
 
     print_section("Your Playlists")
     for i, name in enumerate(names, start=1):
-        idx_label = styled(Ansi.BOLD, Ansi.CYAN,  text=f"[{i}]")
-        name_text = styled(Ansi.WHITE,             text=name)
+        idx_label = styled(Ansi.BOLD, Ansi.CYAN, text=f"[{i}]")
+        name_text = styled(Ansi.WHITE, text=name)
         print(f"  {idx_label}  {name_text}")
 
     exit_label = styled(Ansi.BOLD, Ansi.RED, text="[0]")
@@ -344,7 +448,7 @@ def select_speed() -> float:
     """Display the speed menu and return the chosen playback speed."""
     custom_idx = len(_PRESET_SPEEDS) + 1
 
-    # Locate the default speed index (1-based); fall back to 1 if not found.
+    # 1-based index of the default speed; fall back to the first entry.
     try:
         default_idx = _PRESET_SPEEDS.index(_DEFAULT_SPEED) + 1
     except ValueError:
@@ -354,7 +458,7 @@ def select_speed() -> float:
     print_section("Playback Speed")
     for i, speed in enumerate(_PRESET_SPEEDS, start=1):
         idx_label = styled(Ansi.BOLD, Ansi.CYAN, text=f"[{i}]")
-        spd_text  = styled(Ansi.WHITE,            text=f"{speed:.2f}x")
+        spd_text  = styled(Ansi.WHITE, text=f"{speed:.2f}x")
         default_marker = (
             styled(Ansi.BOLD, Ansi.GREEN, text=" ◀ default (Enter)")
             if speed == _DEFAULT_SPEED else ""
@@ -364,7 +468,7 @@ def select_speed() -> float:
     custom_label = styled(Ansi.BOLD, Ansi.YELLOW, text=f"[{custom_idx}]")
     print(f"  {custom_label}  Custom speed\n")
 
-    choice = prompt_int_or_default(
+    choice = prompt_int(
         f"  Select a speed (Enter = {_DEFAULT_SPEED:.2f}x): ",
         lo=1,
         hi=custom_idx,
@@ -372,30 +476,55 @@ def select_speed() -> float:
     )
 
     if choice == custom_idx:
-        return prompt_positive_float("  Enter custom speed (e.g. 1.3): ")
+        return prompt_speed("  Enter custom speed (e.g. 1.3): ")
 
     return _PRESET_SPEEDS[choice - 1]
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 
-def main() -> None:
-    config_path = _resolve_config_path(sys.argv)
-    playlists   = load_playlists(config_path)
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        prog="jukempv",
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument(
+        "config",
+        nargs="?",
+        default=None,
+        help=f"path to the playlist config (default: {CONFIG_FILENAME} next to this script)",
+    )
+    parser.add_argument("--no-video", action="store_true", help="never open a video window")
+    parser.add_argument("--no-shuffle", action="store_true", help="play in original order")
+    return parser.parse_args(argv)
 
-    if not playlists:
-        raise SystemExit(styled(Ansi.RED, text="No playlists found in config."))
+
+def main(argv: list[str] | None = None) -> int:
+    _init_terminal()
+    args = parse_args(argv)
+
+    try:
+        playlists = load_playlists(resolve_config_path(args.config))
+    except ConfigError as exc:
+        die(str(exc))
 
     clear_screen()
     print_header()
 
     playlist_name, url = select_playlist(playlists)
-    speed              = select_speed()
+    speed = select_speed()
 
     print_ok(f"Speed set to {speed:.2f}x")
 
-    launch_mpv(url=url, speed=speed, label=playlist_name)
+    launch_mpv(
+        url=url,
+        speed=speed,
+        label=playlist_name,
+        shuffle=not args.no_shuffle,
+        no_video=args.no_video,
+    )
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

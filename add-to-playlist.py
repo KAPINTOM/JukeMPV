@@ -3,8 +3,9 @@
 add-to-playlist.py
 ==================
 Add a YouTube video or playlist URL to a local ``playlists.json`` catalogue.
-Supports regular YouTube links, ``youtu.be`` short-links, and
-``music.youtube.com`` links (automatically rewritten to ``www.youtube.com``).
+Supports regular YouTube links, ``youtu.be`` short-links, ``/shorts/`` and
+``/embed/`` links, and ``music.youtube.com`` links (all rewritten to the
+canonical ``www.youtube.com`` form so duplicates are detected reliably).
 
 Usage
 -----
@@ -15,38 +16,56 @@ Non-interactive (pass URL directly):
     python add-to-playlist.py <url>
 
 Optional flags:
-    --dry-run   Resolve the title but do not write to disk.
-    --verbose   Print debug-level information.
+    --name TEXT    Store the entry under this name instead of the YouTube title
+                   (also skips the network lookup).
+    --dry-run      Resolve the title but do not write to disk.
+    --verbose      Print debug-level information.
     --json <path>  Override the default playlists.json path.
 """
 
 from __future__ import annotations
 
 import argparse
+import http.client
 import json
 import logging
 import os
+import re
 import shutil
 import sys
 import tempfile
 import time
 import urllib.error
 import urllib.request
-from urllib.parse import ParseResult, parse_qs, urlencode, urlparse, urlunparse
+from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
 
-SCRIPT_DIR: str = os.path.dirname(os.path.abspath(__file__))
-DEFAULT_JSON_PATH: str = os.path.join(SCRIPT_DIR, "playlists.json")
+
+def _base_dir() -> str:
+    """Directory holding the script — or the executable when frozen (PyInstaller)."""
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(os.path.abspath(sys.executable))
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+DEFAULT_JSON_PATH: str = os.path.join(_base_dir(), "playlists.json")
 
 YOUTUBE_HOSTS: frozenset[str] = frozenset(
     {"www.youtube.com", "youtube.com", "youtu.be", "m.youtube.com", "music.youtube.com"}
 )
 
-# Tracking / noise query parameters that should be stripped from stored URLs.
+# Tracking / noise query parameters stripped from stored URLs.
 _STRIP_PARAMS: frozenset[str] = frozenset({"si", "pp", "feature", "ab_channel"})
+_STRIP_PREFIXES: tuple[str, ...] = ("utm_",)
+
+# Canonical query-parameter order: v, then list, then everything else A→Z.
+_PARAM_ORDER: dict[str, int] = {"v": 0, "list": 1}
+
+# /shorts/<id>, /embed/<id>, /live/<id>, /v/<id>  →  /watch?v=<id>
+_VIDEO_ID_PATH = re.compile(r"^/(?:shorts|embed|live|v)/([A-Za-z0-9_-]{11})")
 
 _REQUEST_HEADERS: dict[str, str] = {
     "User-Agent": (
@@ -57,9 +76,13 @@ _REQUEST_HEADERS: dict[str, str] = {
     "Accept-Language": "en-US,en;q=0.9",
 }
 
-_NETWORK_TIMEOUT: int = 15          # seconds per request attempt
-_MAX_RETRIES: int = 3               # total attempts before giving up
-_RETRY_BACKOFF: float = 1.5        # seconds; doubles on each retry
+_NETWORK_TIMEOUT: int = 15            # seconds per request attempt
+_MAX_RETRIES: int = 3                 # total attempts before giving up
+_RETRY_BACKOFF: float = 1.5           # seconds; doubles on each retry
+_RETRYABLE_STATUS: frozenset[int] = frozenset({429, 500, 502, 503, 504})
+_MAX_RESPONSE_BYTES: int = 8 * 1024 * 1024   # sanity cap on downloaded pages
+
+_OEMBED_ENDPOINT = "https://www.youtube.com/oembed"
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -68,200 +91,214 @@ _RETRY_BACKOFF: float = 1.5        # seconds; doubles on each retry
 log = logging.getLogger("add-to-playlist")
 
 
+class _BelowLevel(logging.Filter):
+    """Pass only records strictly below *level* (used to keep stdout/stderr apart)."""
+
+    def __init__(self, level: int) -> None:
+        super().__init__()
+        self._level = level
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        return record.levelno < self._level
+
+
 def _configure_logging(verbose: bool) -> None:
-    level = logging.DEBUG if verbose else logging.INFO
-    handler = logging.StreamHandler(sys.stdout)
-    handler.setFormatter(logging.Formatter("%(levelname)s: %(message)s"))
-    log.setLevel(level)
-    log.addHandler(handler)
+    """INFO/DEBUG go to stdout; WARNING and above go to stderr."""
+    # Never crash on characters the console encoding can't represent.
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is not None:
+            try:
+                reconfigure(errors="replace")
+            except (OSError, ValueError):
+                pass
+
+    formatter = logging.Formatter("%(levelname)s: %(message)s")
+
+    out = logging.StreamHandler(sys.stdout)
+    out.addFilter(_BelowLevel(logging.WARNING))
+    out.setFormatter(formatter)
+
+    err = logging.StreamHandler(sys.stderr)
+    err.setLevel(logging.WARNING)
+    err.setFormatter(formatter)
+
+    log.handlers.clear()            # idempotent if called more than once
+    log.addHandler(out)
+    log.addHandler(err)
+    log.setLevel(logging.DEBUG if verbose else logging.INFO)
+    log.propagate = False
 
 
 # ---------------------------------------------------------------------------
 # URL helpers
 # ---------------------------------------------------------------------------
 
+def _parse(url: str):
+    """``urlparse`` that tolerates a pasted link with no ``https://`` prefix."""
+    url = url.strip()
+    if "://" not in url:
+        url = "https://" + url
+    return urlparse(url)
+
+
 def is_youtube_url(url: str) -> bool:
-    """Return *True* only for recognised YouTube hostnames."""
+    """Return *True* only for http(s) links on recognised YouTube hostnames."""
     try:
-        return urlparse(url).netloc.lower() in YOUTUBE_HOSTS
-    except Exception:
+        parsed = _parse(url)
+        return parsed.scheme in ("http", "https") and (parsed.hostname or "").lower() in YOUTUBE_HOSTS
+    except ValueError:
         return False
+
+
+def _is_noise_param(key: str) -> bool:
+    return key in _STRIP_PARAMS or key.startswith(_STRIP_PREFIXES)
 
 
 def normalize_url(url: str) -> str:
     """
-    Canonicalize a YouTube URL so that semantically identical links are stored
-    as a single entry.
+    Canonicalize a YouTube URL so semantically identical links share one form.
 
-    Steps applied:
-      1. Strip tracking / noise query parameters (``si``, ``pp``, …).
-      2. Convert ``youtu.be/<id>`` short-links to the canonical watch URL.
-      3. Rewrite ``music.youtube.com`` links to ``www.youtube.com``.
-      4. Remove any URL fragment (``#t=30``).
+    Applied to YouTube hosts only (other http(s) URLs are returned untouched,
+    since jukempv accepts any URL mpv can play):
+
+      1. All YouTube hostnames → ``https://www.youtube.com``.
+      2. ``youtu.be/<id>``, ``/shorts/<id>``, ``/embed/<id>`` → ``/watch?v=<id>``.
+      3. Tracking parameters (``si``, ``pp``, ``utm_*`` …) and the fragment are dropped.
+      4. Remaining parameters get a stable order (``v``, ``list``, then A→Z), so
+         ``?list=X&v=Y`` and ``?v=Y&list=X`` compare equal.
     """
-    parsed: ParseResult = urlparse(url)
-    host = parsed.netloc.lower()
+    url = url.strip()
+    try:
+        parsed = _parse(url)
+        host = (parsed.hostname or "").lower()
+    except ValueError:
+        return url
+    if host not in YOUTUBE_HOSTS:
+        return url
 
-    # Expand youtu.be/<video-id> → youtube.com/watch?v=<video-id>
+    query = [
+        (k, v)
+        for k, v in parse_qsl(parsed.query, keep_blank_values=True)
+        if not _is_noise_param(k)
+    ]
+    path = parsed.path
+
+    video_id = ""
     if host == "youtu.be":
-        video_id = parsed.path.lstrip("/")
-        query = parse_qs(parsed.query, keep_blank_values=True)
-        query["v"] = [video_id]
-        query = {k: v for k, v in query.items() if k not in _STRIP_PARAMS}
-        new_query = urlencode(query, doseq=True)
-        parsed = ParseResult(
-            scheme="https",
-            netloc="www.youtube.com",
-            path="/watch",
-            params="",
-            query=new_query,
-            fragment="",
-        )
-        log.debug("Expanded short-link → %s", parsed.geturl())
-        return parsed.geturl()
+        video_id = path.strip("/").split("/")[0]
+    else:
+        match = _VIDEO_ID_PATH.match(path)
+        if match:
+            video_id = match.group(1)
 
-    # Rewrite music.youtube.com → www.youtube.com so the stored URL is always
-    # the standard YouTube domain, regardless of which surface the user copied
-    # the link from.
-    if host == "music.youtube.com":
-        log.debug("Rewriting music.youtube.com → www.youtube.com")
-        parsed = parsed._replace(
-            scheme="https",
-            netloc="www.youtube.com",
-        )
+    if video_id:
+        query = [(k, v) for k, v in query if k != "v"]
+        query.append(("v", video_id))
+        path = "/watch"
+        log.debug("Rewrote %s path → /watch?v=%s", host, video_id)
 
-    # Strip noise parameters and fragment from regular URLs.
-    query_dict = {
-        k: v
-        for k, v in parse_qs(parsed.query, keep_blank_values=True).items()
-        if k not in _STRIP_PARAMS
-    }
-    stripped = parse_qs(parsed.query, keep_blank_values=True).keys() - query_dict.keys()
-    if stripped:
-        log.debug("Stripped query parameters: %s", ", ".join(sorted(stripped)))
+    query.sort(key=lambda kv: (_PARAM_ORDER.get(kv[0], 2), kv[0]))
+    return urlunparse(("https", "www.youtube.com", path, "", urlencode(query), ""))
 
-    clean_query = urlencode(query_dict, doseq=True) if query_dict else ""
-    return urlunparse(parsed._replace(query=clean_query, fragment=""))
+
+def has_media_id(url: str) -> bool:
+    """True if a (normalized) URL points at a specific video or playlist."""
+    params = dict(parse_qsl(urlparse(url).query))
+    return bool(params.get("v") or params.get("list"))
 
 
 # ---------------------------------------------------------------------------
 # Network
 # ---------------------------------------------------------------------------
 
-def fetch_html(url: str) -> str | None:
+def fetch_text(url: str) -> str | None:
     """
-    Fetch the raw HTML of *url* with browser-like headers.
+    Fetch *url* and return the decoded body, or *None* on failure.
 
-    Retries up to ``_MAX_RETRIES`` times with exponential back-off for
-    transient errors (network timeouts, 5xx responses).  Permanent client
-    errors (4xx except 429) are not retried.
+    Retries up to ``_MAX_RETRIES`` times with exponential back-off on
+    transient failures (timeouts, dropped connections, 429 and 5xx).  Other
+    client errors (404, 403 …) are not retried.
     """
-    req = urllib.request.Request(url, headers=_REQUEST_HEADERS)
     delay = _RETRY_BACKOFF
 
     for attempt in range(1, _MAX_RETRIES + 1):
+        req = urllib.request.Request(url, headers=_REQUEST_HEADERS)
         try:
             with urllib.request.urlopen(req, timeout=_NETWORK_TIMEOUT) as resp:
-                html = resp.read().decode("utf-8")
-                if not html:
-                    log.warning("Response body was empty (attempt %d).", attempt)
-                    return None
-                log.debug("Fetched %d bytes from %s.", len(html), url)
-                return html
-
-        except urllib.error.HTTPError as exc:
-            log.debug("HTTP %d %s (attempt %d).", exc.code, exc.reason, attempt)
-            # Rate-limited or server-side error → retry; anything else → abort.
-            if exc.code in {429, 500, 502, 503, 504} and attempt < _MAX_RETRIES:
-                log.warning("HTTP %d — retrying in %.1fs…", exc.code, delay)
-                time.sleep(delay)
-                delay *= 2
-            else:
-                log.error("HTTP error %d: %s", exc.code, exc.reason)
+                raw = resp.read(_MAX_RESPONSE_BYTES)
+                charset = resp.headers.get_content_charset() or "utf-8"
+            try:
+                text = raw.decode(charset, errors="replace")
+            except LookupError:                 # server announced an unknown charset
+                text = raw.decode("utf-8", errors="replace")
+            if not text:
+                log.warning("Response body was empty.")
                 return None
+            log.debug("Fetched %d bytes from %s.", len(raw), url)
+            return text
 
+        except urllib.error.HTTPError as exc:   # must precede URLError (subclass)
+            reason = f"HTTP {exc.code} {exc.reason}"
+            retryable = exc.code in _RETRYABLE_STATUS
+            exc.close()
         except urllib.error.URLError as exc:
-            log.debug("URLError: %s (attempt %d).", exc.reason, attempt)
-            if attempt < _MAX_RETRIES:
-                log.warning("Network error — retrying in %.1fs…", delay)
-                time.sleep(delay)
-                delay *= 2
-            else:
-                log.error("Network error: %s", exc.reason)
-                return None
+            reason = f"network error: {exc.reason}"
+            retryable = True
+        except (http.client.HTTPException, OSError) as exc:
+            # Covers read timeouts, connection resets, truncated responses…
+            reason = f"{type(exc).__name__}: {exc}"
+            retryable = True
 
-        except TimeoutError:
-            log.debug("Request timed out (attempt %d).", attempt)
-            if attempt < _MAX_RETRIES:
-                log.warning("Timeout — retrying in %.1fs…", delay)
-                time.sleep(delay)
-                delay *= 2
-            else:
-                log.error("Request timed out after %d attempts.", _MAX_RETRIES)
-                return None
+        if retryable and attempt < _MAX_RETRIES:
+            log.warning("%s — retrying in %.1fs (attempt %d/%d)…",
+                        reason, delay, attempt, _MAX_RETRIES)
+            time.sleep(delay)
+            delay *= 2
+            continue
 
-    return None  # unreachable, but satisfies type checkers
+        log.error("Request failed: %s", reason)
+        return None
+
+    return None  # unreachable; keeps type checkers happy
 
 
 # ---------------------------------------------------------------------------
 # JSON-blob extraction
 # ---------------------------------------------------------------------------
 
+_JSON_DECODER = json.JSONDecoder()
+
+
+def _assignment_patterns(var_name: str) -> tuple[re.Pattern[str], ...]:
+    name = re.escape(var_name)
+    return (
+        # var ytInitialData = {…}   /   ytInitialData = {…}
+        re.compile(rf"(?<![\w$.]){name}\s*=\s*(?=\{{)"),
+        # window["ytInitialData"] = {…}
+        re.compile(rf"""window\s*\[\s*["']{name}["']\s*\]\s*=\s*(?=\{{)"""),
+    )
+
+
 def _extract_json_blob(html: str, var_name: str) -> dict | None:
     """
-    Extract a JavaScript object literal assigned to *var_name*.
+    Extract the JSON object assigned to the JavaScript variable *var_name*.
 
-    Example target::
-
-        var ytInitialData = { … };
-
-    The parser walks the string character-by-character tracking brace depth and
-    string-literal boundaries (both ``"`` and ``'``), correctly handling escape
-    sequences.  This avoids the truncation bug caused by naïve regex matching on
-    the first ``};``.
+    Uses ``JSONDecoder.raw_decode`` starting at the opening brace, so nested
+    braces, braces inside strings and escape sequences are all handled by the
+    real JSON parser rather than a hand-rolled scanner.
     """
-    marker = f"var {var_name} = {{"
-    start = html.find(marker)
-    if start == -1:
-        log.debug("Marker '%s' not found in HTML.", marker)
-        return None
-
-    # Rewind to the opening ``{``.
-    start += len(marker) - 1
-    depth = 0
-    in_string = False
-    string_char = ""
-    i = start
-
-    while i < len(html):
-        ch = html[i]
-
-        if in_string:
-            if ch == "\\" :
-                i += 2          # skip the escaped character entirely
+    for pattern in _assignment_patterns(var_name):
+        for match in pattern.finditer(html):
+            try:
+                obj, _end = _JSON_DECODER.raw_decode(html, match.end())
+            except json.JSONDecodeError as exc:
+                log.debug("JSON parse error in '%s': %s", var_name, exc)
                 continue
-            if ch == string_char:
-                in_string = False
-        else:
-            if ch in ('"', "'"):
-                in_string = True
-                string_char = ch
-            elif ch == "{":
-                depth += 1
-            elif ch == "}":
-                depth -= 1
-                if depth == 0:
-                    blob = html[start : i + 1]
-                    try:
-                        result = json.loads(blob)
-                        log.debug("Parsed '%s' (%d bytes).", var_name, len(blob))
-                        return result
-                    except json.JSONDecodeError as exc:
-                        log.debug("JSON parse error in '%s': %s", var_name, exc)
-                        return None
-        i += 1
-
-    log.debug("No matching closing brace found for '%s'.", var_name)
+            if isinstance(obj, dict):
+                log.debug("Parsed '%s'.", var_name)
+                return obj
+    log.debug("No parsable assignment for '%s' found.", var_name)
     return None
 
 
@@ -269,9 +306,8 @@ def _extract_json_blob(html: str, var_name: str) -> dict | None:
 # Title extraction
 # ---------------------------------------------------------------------------
 
-# Ordered sequence of (description, dotted-key-path) pairs tried against
-# ytInitialData.  A dotted path of the form ``a.b.0.c`` resolves nested
-# dicts/lists; an integer segment is treated as a list index.
+# Ordered (description, dotted-key-path) pairs tried against ytInitialData.
+# Integer segments index into lists; everything else is a dict key.
 _INITIAL_DATA_TITLE_PATHS: list[tuple[str, str]] = [
     ("video details",           "videoDetails.title"),
     ("playlist metadata",       "metadata.playlistMetadataRenderer.title"),
@@ -287,54 +323,85 @@ _INITIAL_DATA_TITLE_PATHS: list[tuple[str, str]] = [
 ]
 
 
-def _deep_get(data: dict | list, dotted_path: str) -> object | None:
+def _deep_get(data: object, dotted_path: str) -> object | None:
     """
     Traverse nested dicts/lists using a dot-separated path.
 
-    Integer path segments are used as list indices.  Returns *None* on any
-    missing key, out-of-range index, or type mismatch.
+    A segment is used as a list index when the current node is a list, and as
+    a (string) dict key otherwise — so numeric dict keys still work.  Returns
+    *None* on any missing key, bad index or type mismatch.
     """
-    current: object = data
+    current = data
     for segment in dotted_path.split("."):
-        try:
-            key: int | str = int(segment)
-        except ValueError:
-            key = segment
-        try:
-            current = current[key]  # type: ignore[index]
-        except (KeyError, IndexError, TypeError):
+        if isinstance(current, list):
+            try:
+                current = current[int(segment)]
+            except (ValueError, IndexError):
+                return None
+        elif isinstance(current, dict):
+            if segment not in current:
+                return None
+            current = current[segment]
+        else:
             return None
     return current
+
+
+def clean_title(title: object) -> str | None:
+    """Collapse whitespace; return *None* for anything that isn't a usable string."""
+    if not isinstance(title, str):
+        return None
+    cleaned = " ".join(title.split())
+    return cleaned or None
+
+
+def _title_from_oembed(url: str) -> str | None:
+    """Fallback: YouTube's public oEmbed endpoint (stable, tiny JSON response)."""
+    endpoint = f"{_OEMBED_ENDPOINT}?{urlencode({'url': url, 'format': 'json'})}"
+    body = fetch_text(endpoint)
+    if not body:
+        return None
+    try:
+        payload = json.loads(body)
+    except json.JSONDecodeError:
+        return None
+    return clean_title(payload.get("title")) if isinstance(payload, dict) else None
 
 
 def get_youtube_title(url: str) -> str | None:
     """
     Resolve the human-readable title of a YouTube video or playlist.
 
-    Extraction strategy (in order):
+    Strategies, in order:
       1. ``ytInitialPlayerResponse.videoDetails.title`` — video pages only.
-      2. Several paths inside ``ytInitialData`` — covers both videos and playlists.
+      2. Several paths inside ``ytInitialData`` — videos and playlists.
+      3. The oEmbed endpoint, if the page loaded but its embedded data was
+         missing or reshaped (YouTube changes this markup from time to time).
     """
-    html = fetch_html(url)
+    html = fetch_text(url)
     if not html:
         return None
 
-    # --- Strategy 1: ytInitialPlayerResponse (video pages) ---
     player_resp = _extract_json_blob(html, "ytInitialPlayerResponse")
     if player_resp:
-        title = _deep_get(player_resp, "videoDetails.title")
-        if isinstance(title, str) and title:
+        title = clean_title(_deep_get(player_resp, "videoDetails.title"))
+        if title:
             log.debug("Title from ytInitialPlayerResponse: %r", title)
             return title
 
-    # --- Strategy 2: ytInitialData (videos + playlists) ---
     initial_data = _extract_json_blob(html, "ytInitialData")
     if initial_data:
         for description, path in _INITIAL_DATA_TITLE_PATHS:
-            title = _deep_get(initial_data, path)
-            if isinstance(title, str) and title:
+            title = clean_title(_deep_get(initial_data, path))
+            if title:
                 log.debug("Title from ytInitialData[%s]: %r", description, title)
                 return title
+
+    log.debug("Page scraping found no title; trying oEmbed.")
+    title = _title_from_oembed(url)
+    if title:
+        log.debug("Title from oEmbed: %r", title)
+        return title
 
     log.warning("Could not extract title from page.")
     return None
@@ -344,54 +411,67 @@ def get_youtube_title(url: str) -> str | None:
 # Catalogue (playlists.json) management
 # ---------------------------------------------------------------------------
 
+class CatalogueError(Exception):
+    """The catalogue exists but cannot be read safely."""
+
+
 def load_catalogue(path: str) -> dict[str, str]:
     """
-    Load the JSON catalogue from *path*.
+    Load the JSON catalogue from *path* (empty dict if it doesn't exist yet).
 
-    Returns an empty dict if the file does not exist.  On corruption, backs up
-    the broken file with a ``.bak`` suffix before returning an empty dict so
-    the user's data is preserved.
+    A file that exists but is unreadable or malformed raises ``CatalogueError``
+    and is left untouched — silently starting from an empty catalogue would
+    overwrite the user's data on the next save.
     """
     if not os.path.isfile(path):
         log.debug("Catalogue not found at %s — starting fresh.", path)
         return {}
     try:
-        with open(path, encoding="utf-8") as fh:
+        # utf-8-sig tolerates the BOM that Windows Notepad adds.
+        with open(path, encoding="utf-8-sig") as fh:
             data = json.load(fh)
-        if not isinstance(data, dict):
-            raise ValueError(f"Expected a JSON object, got {type(data).__name__}.")
-        log.debug("Loaded %d entries from %s.", len(data), path)
-        return data
-    except (json.JSONDecodeError, ValueError) as exc:
-        backup = path + ".bak"
-        shutil.copy2(path, backup)
-        log.error(
-            "Catalogue is malformed (%s).  "
-            "A backup was saved to %s.  Starting with an empty catalogue.",
-            exc,
-            backup,
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        raise CatalogueError(
+            f"{path} is not valid JSON ({exc}). "
+            "Fix or remove it and try again; the file was not modified."
+        ) from None
+    except OSError as exc:
+        raise CatalogueError(f"Could not read {path}: {exc}") from None
+
+    if not isinstance(data, dict) or not all(
+        isinstance(k, str) and isinstance(v, str) for k, v in data.items()
+    ):
+        raise CatalogueError(
+            f"{path} must contain a flat JSON object of name → URL strings. "
+            "The file was not modified."
         )
-        return {}
+    log.debug("Loaded %d entries from %s.", len(data), path)
+    return data
 
 
 def save_catalogue(path: str, data: dict[str, str]) -> None:
     """
     Persist *data* to *path* atomically.
 
-    Writes to a sibling temporary file first and then replaces the target with
-    ``os.replace`` (which is atomic on POSIX and best-effort on Windows).  This
-    prevents corruption if the process is interrupted mid-write.
+    Writes and fsyncs a sibling temporary file, then swaps it in with
+    ``os.replace`` so an interrupted run can never leave a half-written file.
+    Existing file permissions are preserved.
     """
-    directory = os.path.dirname(path) or "."
-    tmp_fd, tmp_path = tempfile.mkstemp(dir=directory, suffix=".tmp")
+    directory = os.path.dirname(os.path.abspath(path))
+    os.makedirs(directory, exist_ok=True)
+
+    tmp_fd, tmp_path = tempfile.mkstemp(dir=directory, prefix=".playlists-", suffix=".tmp")
     try:
-        with os.fdopen(tmp_fd, "w", encoding="utf-8") as fh:
+        with os.fdopen(tmp_fd, "w", encoding="utf-8", newline="\n") as fh:
             json.dump(data, fh, indent=2, ensure_ascii=False)
             fh.write("\n")
+            fh.flush()
+            os.fsync(fh.fileno())
+        if os.path.exists(path):
+            shutil.copymode(path, tmp_path)     # mkstemp creates 0600 files
         os.replace(tmp_path, path)
         log.debug("Catalogue saved atomically to %s.", path)
-    except Exception:
-        # Clean up the orphaned temp file before re-raising.
+    except BaseException:
         try:
             os.unlink(tmp_path)
         except OSError:
@@ -403,18 +483,26 @@ def find_existing_entry(
     catalogue: dict[str, str], url: str
 ) -> tuple[str, str] | None:
     """
-    Return the ``(title, stored_url)`` pair if *url* already appears in
-    *catalogue*, or *None* otherwise.
+    Return ``(name, stored_url)`` if *url* is already in *catalogue*.
 
-    Comparison is performed on the normalized forms of both URLs so that
-    equivalent links with different parameter ordering or tracking tokens are
-    recognized as duplicates.
+    Both sides are normalized first, so links that differ only in parameter
+    order, tracking tokens or host variant count as duplicates.
     """
     canonical = normalize_url(url)
-    for title, stored_url in catalogue.items():
+    for name, stored_url in catalogue.items():
         if normalize_url(stored_url) == canonical:
-            return title, stored_url
+            return name, stored_url
     return None
+
+
+def make_unique_name(catalogue: dict[str, str], name: str) -> str:
+    """Append ``(2)``, ``(3)`` … so a new entry never overwrites a different one."""
+    if name not in catalogue:
+        return name
+    n = 2
+    while f"{name} ({n})" in catalogue:
+        n += 1
+    return f"{name} ({n})"
 
 
 # ---------------------------------------------------------------------------
@@ -423,9 +511,7 @@ def find_existing_entry(
 
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description=(
-            "Add a YouTube video or playlist URL to playlists.json."
-        ),
+        description="Add a YouTube video or playlist URL to playlists.json.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
@@ -434,6 +520,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         nargs="?",
         default=None,
         help="YouTube URL to add.  If omitted, the script prompts interactively.",
+    )
+    parser.add_argument(
+        "--name",
+        default=None,
+        metavar="TEXT",
+        help="Name to store the entry under (skips the title lookup).",
     )
     parser.add_argument(
         "--json",
@@ -463,45 +555,54 @@ def run(
     raw_url: str,
     json_path: str,
     *,
+    name: str | None = None,
     dry_run: bool = False,
 ) -> int:
     """
-    Core logic: validate → normalize → resolve title → deduplicate → persist.
+    Core logic: validate → normalize → deduplicate → resolve title → persist.
 
     Returns 0 on success, 1 on any recoverable error.
     """
     # 1. Validate.
+    raw_url = raw_url.strip()
     if not is_youtube_url(raw_url):
         log.error("Not a recognised YouTube URL: %s", raw_url)
         return 1
 
     # 2. Normalize.
     url = normalize_url(raw_url)
+    if not has_media_id(url):
+        log.error("URL doesn't point at a video or playlist: %s", raw_url)
+        return 1
     if url != raw_url:
         log.info("Normalized URL: %s", url)
 
-    # 3. Resolve title.
-    title = get_youtube_title(url)
-    if not title:
-        log.error("Could not retrieve title.  Check the URL and your connection.")
+    # 3. Load the catalogue and check for duplicates *before* any network work.
+    #    An existing entry is left exactly as the user has it — including any
+    #    custom name they gave it.
+    try:
+        catalogue = load_catalogue(json_path)
+    except CatalogueError as exc:
+        log.error("%s", exc)
         return 1
 
+    existing = find_existing_entry(catalogue, url)
+    if existing is not None:
+        log.info("Already in the catalogue as %r — no changes made.", existing[0])
+        return 0
+
+    # 4. Resolve the name.
+    title = clean_title(name) if name else get_youtube_title(url)
+    if not title:
+        log.error("Could not determine a title.  Check the URL and your "
+                  "connection, or supply one with --name.")
+        return 1
     log.info("Title: %s", title)
 
-    # 4. Load catalogue and check for duplicates.
-    catalogue = load_catalogue(json_path)
-    existing = find_existing_entry(catalogue, url)
-
-    if existing is not None:
-        existing_title, existing_url = existing
-        if existing_title == title and existing_url == url:
-            log.info("Entry already present — no changes made.")
-            return 0
-        # URL is the same but title or stored form differs; update the entry.
-        log.info("Updating existing entry %r.", existing_title)
-        # Remove the old key if the title changed.
-        if existing_title != title:
-            del catalogue[existing_title]
+    unique = make_unique_name(catalogue, title)
+    if unique != title:
+        log.warning("Another entry is already named %r; saving as %r.", title, unique)
+        title = unique
 
     # 5. Persist.
     catalogue[title] = url
@@ -511,25 +612,39 @@ def run(
         log.info("[dry-run] Catalogue path: %s", json_path)
         return 0
 
-    save_catalogue(json_path, catalogue)
+    try:
+        save_catalogue(json_path, catalogue)
+    except OSError as exc:
+        log.error("Could not write %s: %s", json_path, exc)
+        return 1
+
     log.info('Saved: "%s" → %s', title, url)
     log.info("Catalogue: %s  (%d entries total)", json_path, len(catalogue))
     return 0
 
 
-def main(argv: list[str] | None = None) -> None:
-    parser = build_arg_parser()
-    args = parser.parse_args(argv)
-
+def main(argv: list[str] | None = None) -> int:
+    args = build_arg_parser().parse_args(argv)
     _configure_logging(args.verbose)
 
-    raw_url: str = args.url or input("Enter YouTube video or playlist URL: ").strip()
-    if not raw_url:
-        log.error("No URL provided.")
-        sys.exit(1)
+    raw_url = args.url
+    if raw_url is None:
+        try:
+            raw_url = input("Enter YouTube video or playlist URL: ")
+        except (EOFError, KeyboardInterrupt):
+            print()
+            log.error("No URL provided.")
+            return 1
 
-    sys.exit(run(raw_url, args.json_path, dry_run=args.dry_run))
+    if not raw_url.strip():
+        log.error("No URL provided.")
+        return 1
+
+    return run(raw_url, args.json_path, name=args.name, dry_run=args.dry_run)
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        sys.exit(130)
